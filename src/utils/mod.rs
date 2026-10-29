@@ -9,7 +9,7 @@ pub use args::*;
 pub use device::DeviceList;
 use indicatif::*;
 use indicatif_log_bridge::LogWrapper;
-pub use pattern::HashPattern;
+pub use pattern::{HashPattern, TargetSelector};
 pub use vanity_key::VanitySecretKey;
 
 /// Do SHA-1 padding manually

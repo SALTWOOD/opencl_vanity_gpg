@@ -1,2 +1,7 @@
 /target
 OpenCL.lib
+
+# Generated vanity keys: they contain secret keys, never commit them
+vanity-keys/
+vanity_keys/
+*-sec.asc

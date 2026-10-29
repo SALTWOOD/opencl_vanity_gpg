@@ -1,4 +1,6 @@
+use anyhow::bail;
 use clap::{Parser, ValueEnum};
+use std::str::FromStr;
 use std::sync::LazyLock;
 
 pub static ARGS: LazyLock<Args> = LazyLock::new(if cfg!(debug_assertions) {
@@ -11,8 +13,9 @@ pub static ARGS: LazyLock<Args> = LazyLock::new(if cfg!(debug_assertions) {
 #[command(version, about, long_about = None)]
 pub struct Args {
     /// Cipher suite of the vanity key
-    /// ed25519, ecdsa-****, rsa**** => Primary key
-    /// cv25519,  ecdh-****          => Subkey
+    /// ed25519, ecdsa-****, rsa****       => Primary key
+    /// cv25519,  ecdh-****                => Subkey
+    /// ed25519-sign, ecdsa-****-sign      => Signing subkey
     /// Use gpg CLI for further editing of the key.
     #[arg(short, long, default_value_t, value_enum, verbatim_doc_comment)]
     pub cipher_suite: CipherSuite,
@@ -22,15 +25,32 @@ pub struct Args {
     pub user_id: String,
 
     /// A pattern less than 40 chars for matching fingerprints
+    /// Can be given multiple times (or comma-separated).
     /// > Format:
-    /// * 0-9A-F are fixed, G-Z are wildcards
-    /// * Other chars will be ignored
-    /// * Case insensitive
+    /// * 0-9A-F are fixed
+    /// * G-Z are wildcards, the same letter must be the same digit (e.g. GGGG)
+    /// * '#' matches a decimal digit (0-9), '*' or '?' match anything
+    /// * '!' negates what follows (e.g. !7 is not 7, G!G means two different digits)
+    /// * '^' anchors at the start of the fingerprint, the default (or '$') at the end
+    /// * Other chars will be ignored, case insensitive
+    /// > Target:
+    /// * Prefix a pattern with primary:, sign:, encrypt: or all: (combine with '+')
+    ///   to match it against those key packets only
+    /// * Without a prefix, the packets given by --algorithm are used
     /// > Example:
     /// * 11XXXX** may output a fingerprint ends with 11222234 or 11AAAABF
     /// * 11XXYYZZ may output a fingerprint ends with 11223344 or 11AABBCC
-    #[arg(short, long, verbatim_doc_comment)]
-    pub pattern: Option<String>,
+    /// * ^ABCD starts with ABCD
+    /// * sign:#### makes the signing subkey end with 4 decimal digits
+    #[arg(short, long, value_delimiter = ',', verbatim_doc_comment)]
+    pub pattern: Vec<String>,
+
+    /// Key packet(s) the patterns are matched against
+    /// primary, encrypt, sign, or all. Can be given multiple times
+    /// (or comma-separated, or joined with '+').
+    /// Defaults to the packet selected by --cipher-suite.
+    #[arg(short = 'a', long, value_delimiter = ',', verbatim_doc_comment)]
+    pub algorithm: Vec<String>,
 
     /// OpenCL kernel function for uint h[5] for matching fingerprints
     /// Ignore the pattern and no estimate is given if this has been set
@@ -60,9 +80,13 @@ pub struct Args {
     #[arg(long)]
     pub timeout: Option<f64>,
 
-    /// Exit after getting a vanity key
-    #[arg(long, default_value_t = false)]
+    /// Exit after getting a vanity key (any pattern matching once)
+    #[arg(long, default_value_t = false, conflicts_with = "shot_all")]
     pub oneshot: bool,
+
+    /// Keep searching until every pattern has matched at least once
+    #[arg(long, default_value_t = false)]
+    pub shot_all: bool,
 
     /// Don't print progress
     #[arg(long, default_value_t = false)]
@@ -101,7 +125,8 @@ impl Default for Args {
         Self {
             cipher_suite: CipherSuite::Ed25519,
             user_id: String::from("Dummy <dummy@example.com>"),
-            pattern: Some(String::from("XXXYYYZZZWWW")),
+            pattern: vec![String::from("XXXYYYZZZWWW")],
+            algorithm: vec![],
             filter: None,
             output: None,
             device: None,
@@ -109,6 +134,7 @@ impl Default for Args {
             iteration: 512,
             timeout: None,
             oneshot: true,
+            shot_all: false,
             no_progress: true,
             no_secret_key_logging: false,
             list_device: false,
@@ -135,4 +161,57 @@ pub enum CipherSuite {
     EcdsaP256,
     EcdsaP384,
     EcdsaP521,
+    Ed25519Sign,
+    EcdsaP256Sign,
+    EcdsaP384Sign,
+    EcdsaP521Sign,
+}
+
+impl CipherSuite {
+    /// The key packet that is searched on the GPU when no target is given.
+    pub fn default_target(self) -> KeyTarget {
+        match self {
+            Self::Cv25519 | Self::EcdhP256 | Self::EcdhP384 | Self::EcdhP521 => KeyTarget::Encrypt,
+            Self::Ed25519Sign | Self::EcdsaP256Sign | Self::EcdsaP384Sign | Self::EcdsaP521Sign => {
+                KeyTarget::Sign
+            }
+            _ => KeyTarget::Primary,
+        }
+    }
+}
+
+/// A key packet of the generated key that a pattern can be matched against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum KeyTarget {
+    /// The primary key packet.
+    Primary,
+    /// The signing subkey (only present in `*-sign` cipher suites).
+    Sign,
+    /// The encryption subkey (absent for RSA keys).
+    Encrypt,
+}
+
+impl KeyTarget {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Primary => "primary key",
+            Self::Sign => "signing subkey",
+            Self::Encrypt => "encryption subkey",
+        }
+    }
+}
+
+impl FromStr for KeyTarget {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "primary" | "p" | "main" | "primary-key" => Ok(Self::Primary),
+            "sign" | "s" | "signing" | "signing-subkey" | "sign-subkey" => Ok(Self::Sign),
+            "encrypt" | "e" | "enc" | "sub" | "subkey" | "encryption" | "encryption-subkey" => {
+                Ok(Self::Encrypt)
+            }
+            _ => bail!("Unknown key target \"{s}\" (expected one of: primary, sign, encrypt)"),
+        }
+    }
 }
