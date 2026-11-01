@@ -145,6 +145,16 @@ pub struct Args {
         conflicts_with = "passphrase"
     )]
     pub passphrase_file: Option<String>,
+
+    /// Search on the CPU instead of the GPU
+    /// No OpenCL device is opened at all, so this also works without an
+    /// OpenCL runtime. --thread and --iteration do not apply.
+    #[arg(long, default_value_t = false, verbatim_doc_comment)]
+    pub cpu: bool,
+
+    /// Number of CPU threads to use with --cpu [default: logical CPUs]
+    #[arg(long, value_name = "N", requires = "cpu")]
+    pub cpu_threads: Option<usize>,
 }
 
 impl Default for Args {
@@ -172,6 +182,8 @@ impl Default for Args {
             key_id: None,
             passphrase: None,
             passphrase_file: None,
+            cpu: false,
+            cpu_threads: None,
         }
     }
 }

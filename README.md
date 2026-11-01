@@ -116,6 +116,12 @@ Options:
           Passphrase of the key given by --key-file, if it is protected
       --passphrase-file <PATH>
           Read the passphrase of --key-file from the first line of a file
+      --cpu
+          Search on the CPU instead of the GPU
+          No OpenCL device is opened at all, so this also works without an
+          OpenCL runtime. --thread and --iteration do not apply.
+      --cpu-threads <N>
+          Number of CPU threads to use with --cpu [default: logical CPUs]
   -h, --help
           Print help
   -V, --version
@@ -252,6 +258,22 @@ $ gpg --import vanity-keys/*.asc
 - 新子密钥继承导入密钥的口令保护：搜索过程中候选密钥不加密，命中后才用同一口令加密。
 - 原有子密钥会保留。GnuPG 加密时一般使用最新的加密子密钥；如果只想使用新子密钥，可以用 `gpg --edit-key` 撤销旧的或给它设置过期时间。
 - 重新导入后如果旧子密钥仍在，它们依然可用，行为与普通的“多子密钥”密钥相同。
+
+# 使用 CPU 计算
+
+没有可用的 GPU，或者想把 GPU 空出来时，可以加 `--cpu` 完全使用 CPU 计算——不会打开任何 OpenCL 设备，即使机器上没有 OpenCL 运行时也能用：
+
+```console
+# 用 12 个线程在 CPU 上算号
+$ opencl_vanity_gpg --cpu --cpu-threads 12 -c ed25519 -p 77777777 --oneshot
+
+# 在已有密钥上追加靓号子密钥同样适用
+$ opencl_vanity_gpg --cpu --key-file mykey.asc -c cv25519 -p 77777777 --oneshot
+```
+
+- `--cpu` 模式下 `--thread`、`--iteration`、`--device` 都不再生效，线程数用 `--cpu-threads`（默认为逻辑 CPU 数）。
+- 只支持 `--pattern`；`--filter` 是 OpenCL 表达式，CPU 模式会直接报错。
+- CPU 后端是纯 Rust 实现，速度约为每线程 3–4M hash/s（12 线程约 40–50M hash/s），比 GPU 慢两个数量级，适合没有 GPU 的机器或较短的 pattern。
 
 # 性能对比
 
