@@ -147,8 +147,9 @@ pub struct Args {
     pub passphrase_file: Option<String>,
 
     /// Search on the CPU instead of the GPU
-    /// No OpenCL device is opened at all, so this also works without an
-    /// OpenCL runtime. --thread and --iteration do not apply.
+    /// No OpenCL device is opened or used, so this works even when there is no
+    /// usable device. The binary still links against the OpenCL runtime.
+    /// --thread and --iteration do not apply.
     #[arg(long, default_value_t = false, verbatim_doc_comment)]
     pub cpu: bool,
 

@@ -118,8 +118,9 @@ Options:
           Read the passphrase of --key-file from the first line of a file
       --cpu
           Search on the CPU instead of the GPU
-          No OpenCL device is opened at all, so this also works without an
-          OpenCL runtime. --thread and --iteration do not apply.
+          No OpenCL device is opened or used, so this works even when there is no
+          usable device. The binary still links against the OpenCL runtime.
+          --thread and --iteration do not apply.
       --cpu-threads <N>
           Number of CPU threads to use with --cpu [default: logical CPUs]
   -h, --help
@@ -261,7 +262,7 @@ $ gpg --import vanity-keys/*.asc
 
 # 使用 CPU 计算
 
-没有可用的 GPU，或者想把 GPU 空出来时，可以加 `--cpu` 完全使用 CPU 计算——不会打开任何 OpenCL 设备，即使机器上没有 OpenCL 运行时也能用：
+没有可用的 GPU，或者想把 GPU 空出来时，可以加 `--cpu` 完全使用 CPU 计算——不会初始化 GPU、也不会打开任何 OpenCL 设备，即使没有可用的 OpenCL 设备也能用（注意程序本身仍然在链接期依赖 OpenCL 运行库）：
 
 ```console
 # 用 12 个线程在 CPU 上算号
