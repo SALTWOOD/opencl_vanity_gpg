@@ -1304,6 +1304,7 @@ dependencies = [
  "ocl",
  "pgp",
  "rand",
+ "sha1",
  "smallvec",
 ]
 

@@ -279,10 +279,10 @@ $ opencl_vanity_gpg --cpu --gpu --key-file mykey.asc -c cv25519 -p 77777777 --on
 ```
 
 - `--cpu` 只用 CPU，不会初始化 GPU，也不会打开任何 OpenCL 设备（但程序仍然在链接期依赖 OpenCL 运行库，除非用 `--no-default-features` 构建）。
-- `--gpu` 就是不写参数时的默认行为。`--cpu --gpu` 时，每轮的时间戳窗口按两者实测速度分给 GPU 和 CPU 并行搜索：CPU 通常只分担约 0.5%–1%，两边搜索不同的时间戳，任意一方先命中就采用谁的结果。CPU 的份额会随每轮实测的 GPU 速度自动调整，并预留一个逻辑 CPU 给 OpenCL 驱动线程，因此不会拖慢 GPU；受算力比例限制，整体提升约 1%。窗口太小时 CPU 会自动不参与该轮。
+- `--gpu` 就是不写参数时的默认行为。`--cpu --gpu` 时，每轮的时间戳窗口按两者实测速度分给 GPU 和 CPU 并行搜索：CPU 通常分担约 1%–2%，两边搜索不同的时间戳，任意一方先命中就采用谁的结果。CPU 的份额会随每轮实测的 GPU 速度自动调整，并预留一个逻辑 CPU 给 OpenCL 驱动线程，因此不会拖慢 GPU；受算力比例限制，整体提升在 1%–2%。窗口太小时 CPU 会自动不参与该轮。
 - `--cpu` 模式下 `--thread`、`--iteration`、`--device` 都不再生效，线程数用 `--cpu-threads`（默认为逻辑 CPU 数；混合模式下会少用一个）。
 - 只支持 `--pattern`：`--filter` 是 OpenCL 表达式，纯 CPU 模式会直接报错；混合模式下 CPU 会自动退出，只用 GPU。
-- CPU 后端是纯 Rust 实现，速度约为每线程 3–4M hash/s（12 线程约 40–50M hash/s），比 GPU 慢两个数量级，适合没有 GPU 的机器、较短的 pattern，或者作为 GPU 的少量补充。
+- CPU 后端使用 RustCrypto 的 SHA-1 实现：CPU 支持 SHA 扩展（Intel Ice Lake / AMD Zen 及更新的型号）时自动走 SHA-NI 硬件指令，12 线程实测约 150M hash/s；不支持时回退到可移植实现（约 40–50M hash/s）。比 GPU 仍慢一到两个数量级，适合没有 GPU 的机器、较短的 pattern，或者作为 GPU 的少量补充。
 
 ## 只构建 CPU 版本
 

@@ -26,6 +26,7 @@ log = "0.4"
 ocl = { version = "0.19", optional = true }
 pgp = "0.14"
 rand = "0.8"
+sha1 = { version = "0.10", features = ["compress"] }
 smallvec = "1.13"
 anyhow = "1.0"
 indicatif = "0.17"

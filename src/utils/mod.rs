@@ -72,7 +72,7 @@ pub fn init_progress_bar(estimate: Option<f64>) -> ProgressBar {
 
     bar.set_style(
         ProgressStyle::default_spinner()
-            .template("[{elapsed_precise}] {bar:50.cyan/blue} {progress} {rate} > {eta_precise}")
+            .template("[{elapsed_precise}] {bar:50.cyan/blue} {progress} {msg} > {eta_precise}")
             .unwrap()
             .progress_chars("##-")
             .with_key("progress", |state: &ProgressState, w: &mut dyn Write| {
@@ -84,14 +84,6 @@ pub fn init_progress_bar(estimate: Option<f64>) -> ProgressBar {
                         None => "???".to_string(),
                         Some(x) => format_number(x as f64),
                     }
-                )
-                .unwrap()
-            })
-            .with_key("rate", |state: &ProgressState, w: &mut dyn Write| {
-                write!(
-                    w,
-                    "{} hash/s",
-                    format_number((state.pos() as f64) / state.elapsed().as_secs_f64()),
                 )
                 .unwrap()
             }),

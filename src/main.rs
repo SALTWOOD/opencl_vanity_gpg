@@ -751,7 +751,14 @@ fn main() -> anyhow::Result<()> {
     let bar = bars.add(init_progress_bar(plan.estimate_hashes()));
 
     let mut hashed: u64 = 0;
+    let mut gpu_hashed: u64 = 0;
+    let mut cpu_hashed: u64 = 0;
     let mut start = Instant::now();
+    bar.set_message(format!(
+        "{} | {}",
+        backend_rate(0, 1.0),
+        backend_rate(0, 1.0)
+    ));
 
     // Calibrate the CPU once; the GPU rate is measured every hybrid round.
     #[cfg(feature = "opencl")]
@@ -785,23 +792,26 @@ fn main() -> anyhow::Result<()> {
     loop {
         debug!("Run one search round");
         #[cfg(feature = "opencl")]
-        let (next_candidates, vanity_result): (
-            Vec<VanitySecretKey>,
-            Option<(u32, u32, u32)>,
+        let ((gpu_span, cpu_span), (next_candidates, vanity_result)): (
+            (u64, u64),
+            (Vec<VanitySecretKey>, Option<(u32, u32, u32)>),
         ) = if !use_gpu {
-            run_cpu_round(
-                &hashdata,
-                &plan,
-                &active,
-                &candidates,
-                appended_target.is_some(),
-                candidates_per_round,
-                bench_size,
-                forward,
-                initial_timestamp,
-                cpu_threads,
-                &mut rng,
-            )?
+            (
+                (0, bench_size),
+                run_cpu_round(
+                    &hashdata,
+                    &plan,
+                    &active,
+                    &candidates,
+                    appended_target.is_some(),
+                    candidates_per_round,
+                    bench_size,
+                    forward,
+                    initial_timestamp,
+                    cpu_threads,
+                    &mut rng,
+                )?,
+            )
         } else if !use_cpu {
             job_sender
                 .as_ref()
@@ -821,9 +831,9 @@ fn main() -> anyhow::Result<()> {
                 .as_ref()
                 .expect("the OpenCL thread is running")
                 .recv()?;
-            (next, result)
+            ((bench_size, 0), (next, result))
         } else {
-            let (next, result, fraction) = run_hybrid_round(
+            let (next, result, fraction, spans) = run_hybrid_round(
                 &mut hashdata,
                 &plan,
                 &active,
@@ -844,31 +854,44 @@ fn main() -> anyhow::Result<()> {
                 cpu_rate,
             )?;
             cpu_fraction = fraction;
-            (next, result)
+            (spans, (next, result))
         };
         #[cfg(not(feature = "opencl"))]
-        let (next_candidates, vanity_result): (
-            Vec<VanitySecretKey>,
-            Option<(u32, u32, u32)>,
-        ) = run_cpu_round(
-            &hashdata,
-            &plan,
-            &active,
-            &candidates,
-            appended_target.is_some(),
-            candidates_per_round,
-            bench_size,
-            forward,
-            initial_timestamp,
-            cpu_threads,
-            &mut rng,
-        )?;
+        let ((gpu_span, cpu_span), (next_candidates, vanity_result)): (
+            (u64, u64),
+            (Vec<VanitySecretKey>, Option<(u32, u32, u32)>),
+        ) = (
+            (0, bench_size),
+            run_cpu_round(
+                &hashdata,
+                &plan,
+                &active,
+                &candidates,
+                appended_target.is_some(),
+                candidates_per_round,
+                bench_size,
+                forward,
+                initial_timestamp,
+                cpu_threads,
+                &mut rng,
+            )?,
+        );
 
-        let work = bench_size * plan.work_per_nonce() * candidates_per_round as u64;
+        let unit = plan.work_per_nonce() * candidates_per_round as u64;
+        let gpu_work = gpu_span * unit;
+        let cpu_work = cpu_span * unit;
+        let work = gpu_work + cpu_work;
         hashed += work;
+        gpu_hashed += gpu_work;
+        cpu_hashed += cpu_work;
         bar.inc(work);
 
         let elapsed = start.elapsed().as_secs_f64();
+        bar.set_message(format!(
+            "{} | {}",
+            backend_rate(gpu_hashed, elapsed),
+            backend_rate(cpu_hashed, elapsed)
+        ));
 
         let mut matched_patterns: Vec<usize> = Vec::new();
         let mut matched_candidate = 0usize;
@@ -969,6 +992,8 @@ fn main() -> anyhow::Result<()> {
             }
 
             hashed = 0;
+            gpu_hashed = 0;
+            cpu_hashed = 0;
             bar.reset();
             start = Instant::now();
         } else if let Some(timeout) = ARGS.timeout {
@@ -1039,6 +1064,15 @@ fn format_timestamp(timestamp: u64) -> String {
     chrono::DateTime::from_timestamp(timestamp as i64, 0)
         .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
         .unwrap_or_else(|| timestamp.to_string())
+}
+
+/// Rate string for one backend in the progress bar; a backend that did no work
+/// shows `--- hash/s`.
+fn backend_rate(hashes: u64, elapsed: f64) -> String {
+    if hashes == 0 || elapsed <= 0.0 {
+        return String::from("--- hash/s");
+    }
+    format!("{} hash/s", format_number(hashes as f64 / elapsed))
 }
 
 /// Number of candidate timestamps the kernel evaluates in one round.
@@ -1161,7 +1195,12 @@ fn run_hybrid_round(
     result_receiver: &Receiver<Option<(u32, u32, u32)>>,
     fraction: f64,
     cpu_rate: f64,
-) -> anyhow::Result<(Vec<VanitySecretKey>, Option<(u32, u32, u32)>, f64)> {
+) -> anyhow::Result<(
+    Vec<VanitySecretKey>,
+    Option<(u32, u32, u32)>,
+    f64,
+    (u64, u64),
+)> {
     let cpu_span = cpu_slice(window, count, fraction);
     if cpu_span == 0 {
         // Not enough work to share: keep the whole window on the GPU.
@@ -1171,7 +1210,7 @@ fn run_hybrid_round(
             max_time_range: search_range,
         })?;
         let next = next_candidates(candidates, appended, count, initial_timestamp, rng)?;
-        return Ok((next, result_receiver.recv()?, fraction));
+        return Ok((next, result_receiver.recv()?, fraction, (window, 0)));
     }
 
     let gpu_span = window - cpu_span;
@@ -1229,116 +1268,36 @@ fn run_hybrid_round(
         debug!("hybrid round: match found");
     }
 
-    Ok((next, gpu_result.or(cpu_result), next_fraction))
+    Ok((
+        next,
+        gpu_result.or(cpu_result),
+        next_fraction,
+        (gpu_span, cpu_span),
+    ))
 }
 
-/// SHA-1 over the already padded big-endian words from `manually_prepare_sha1`.
-fn sha1_digest(words: &[u32]) -> [u8; 20] {
+/// The block type of the `sha1` crate's compression function.
+type Sha1Block = sha1::digest::core_api::Block<sha1::Sha1Core>;
+
+/// SHA-1 over `chunks` already padded 64-byte blocks starting at `start`.
+///
+/// `data` holds big-endian message bytes. The `sha1` crate selects the SHA-NI
+/// backend at runtime when the CPU supports it and falls back to a portable
+/// implementation otherwise.
+fn sha1_blocks(data: &[u8], start: usize, chunks: usize) -> [u8; 20] {
+    debug_assert!(start + chunks * 64 <= data.len());
+    // SAFETY: the range was checked above, and `GenericArray<u8, U64>` is a
+    // transparent wrapper over `[u8; 64]` (both have alignment 1).
+    let blocks: &[Sha1Block] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr().add(start) as *const Sha1Block, chunks) };
     let mut state: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
-
-    for block in words.chunks_exact(16) {
-        // Rolling 16-word message schedule; the round groups use fixed
-        // functions so the compiler can unroll them.
-        let mut w = [0u32; 16];
-        w.copy_from_slice(block);
-
-        let (mut a, mut b, mut c, mut d, mut e) =
-            (state[0], state[1], state[2], state[3], state[4]);
-
-        for &word in &w {
-            let f = (b & c) | (!b & d);
-            round(&mut a, &mut b, &mut c, &mut d, &mut e, 0x5A827999, f, word);
-        }
-        for j in 16..20 {
-            w[j & 15] =
-                (w[(j + 13) & 15] ^ w[(j + 8) & 15] ^ w[(j + 2) & 15] ^ w[j & 15]).rotate_left(1);
-            let f = (b & c) | (!b & d);
-            round(
-                &mut a,
-                &mut b,
-                &mut c,
-                &mut d,
-                &mut e,
-                0x5A827999,
-                f,
-                w[j & 15],
-            );
-        }
-        for j in 20..40 {
-            w[j & 15] =
-                (w[(j + 13) & 15] ^ w[(j + 8) & 15] ^ w[(j + 2) & 15] ^ w[j & 15]).rotate_left(1);
-            let f = b ^ c ^ d;
-            round(
-                &mut a,
-                &mut b,
-                &mut c,
-                &mut d,
-                &mut e,
-                0x6ED9EBA1,
-                f,
-                w[j & 15],
-            );
-        }
-        for j in 40..60 {
-            w[j & 15] =
-                (w[(j + 13) & 15] ^ w[(j + 8) & 15] ^ w[(j + 2) & 15] ^ w[j & 15]).rotate_left(1);
-            let f = (b & c) | (b & d) | (c & d);
-            round(
-                &mut a,
-                &mut b,
-                &mut c,
-                &mut d,
-                &mut e,
-                0x8F1BBCDC,
-                f,
-                w[j & 15],
-            );
-        }
-        for j in 60..80 {
-            w[j & 15] =
-                (w[(j + 13) & 15] ^ w[(j + 8) & 15] ^ w[(j + 2) & 15] ^ w[j & 15]).rotate_left(1);
-            let f = b ^ c ^ d;
-            round(
-                &mut a,
-                &mut b,
-                &mut c,
-                &mut d,
-                &mut e,
-                0xCA62C1D6,
-                f,
-                w[j & 15],
-            );
-        }
-
-        state[0] = state[0].wrapping_add(a);
-        state[1] = state[1].wrapping_add(b);
-        state[2] = state[2].wrapping_add(c);
-        state[3] = state[3].wrapping_add(d);
-        state[4] = state[4].wrapping_add(e);
-    }
+    sha1::compress(&mut state, blocks);
 
     let mut digest = [0u8; 20];
     for (i, word) in state.iter().enumerate() {
         digest[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
     }
     digest
-}
-
-/// One SHA-1 compression round.
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-fn round(a: &mut u32, b: &mut u32, c: &mut u32, d: &mut u32, e: &mut u32, k: u32, f: u32, w: u32) {
-    let t = a
-        .rotate_left(5)
-        .wrapping_add(f)
-        .wrapping_add(*e)
-        .wrapping_add(k)
-        .wrapping_add(w);
-    *e = *d;
-    *d = *c;
-    *c = b.rotate_left(30);
-    *b = *a;
-    *a = t;
 }
 
 /// Search the current candidates on the CPU.
@@ -1364,8 +1323,11 @@ fn cpu_search(
 
     let scan = |range: std::ops::Range<u64>| {
         // Each thread keeps its own copy so the timestamp word can be replaced
-        // without synchronisation.
-        let mut data = hashdata.to_vec();
+        // without synchronisation. The hash backend works on big-endian bytes.
+        let mut data = Vec::with_capacity(hashdata.len() * 4);
+        for word in hashdata {
+            data.extend_from_slice(&word.to_be_bytes());
+        }
 
         for offset in range {
             if found.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
@@ -1385,16 +1347,17 @@ fn cpu_search(
                     None => return,
                 }
             };
+            let ts_bytes = ts.to_be_bytes();
 
             let mut mask = 0u32;
             for candidate in 0..candidates {
-                let base = candidate * plan.total_words;
+                let base = candidate * plan.total_words * 4;
                 for (index, (_, pattern_indices)) in plan.target_patterns.iter().enumerate() {
                     let layout = &plan.layout[index];
-                    let start = base + layout.offset;
+                    let start = base + layout.offset * 4;
                     // Word 1 of the packet is its creation time.
-                    data[start + 1] = ts;
-                    let digest = sha1_digest(&data[start..start + layout.chunks * 16]);
+                    data[start + 4..start + 8].copy_from_slice(&ts_bytes);
+                    let digest = sha1_blocks(&data, start, layout.chunks);
                     for &pattern_index in pattern_indices {
                         if active[pattern_index].pattern.is_match(&digest) {
                             mask |= 1u32 << pattern_index;
@@ -1475,7 +1438,11 @@ fn probe_cpu_rate(
             }
             let end = (start + chunk).min(offsets);
             scope.spawn(move || {
-                let mut data = hashdata.to_vec();
+                let mut data = Vec::with_capacity(hashdata.len() * 4);
+                for word in hashdata {
+                    data.extend_from_slice(&word.to_be_bytes());
+                }
+
                 for offset in start..end {
                     let ts = if forward {
                         match nonce.checked_add(offset as u32) {
@@ -1488,12 +1455,13 @@ fn probe_cpu_rate(
                             None => return,
                         }
                     };
+                    let ts_bytes = ts.to_be_bytes();
                     for candidate in 0..candidates {
-                        let base = candidate * plan.total_words;
+                        let base = candidate * plan.total_words * 4;
                         for layout in &plan.layout {
-                            let at = base + layout.offset;
-                            data[at + 1] = ts;
-                            std::hint::black_box(sha1_digest(&data[at..at + layout.chunks * 16]));
+                            let at = base + layout.offset * 4;
+                            data[at + 4..at + 8].copy_from_slice(&ts_bytes);
+                            std::hint::black_box(sha1_blocks(&data, at, layout.chunks));
                         }
                     }
                 }
@@ -1678,14 +1646,24 @@ mod tests {
         assert_eq!(batch_size(u32::MAX, stride), 1);
     }
 
+    /// Padded SHA-1 message bytes for `data`, ready for `sha1_blocks`.
+    fn padded_bytes(data: &[u8]) -> Vec<u8> {
+        manually_prepare_sha1(data.to_vec())
+            .iter()
+            .flat_map(|word| word.to_be_bytes())
+            .collect()
+    }
+
     #[test]
     fn cpu_sha1_matches_known_vectors() {
+        let padded = padded_bytes(b"abc");
         assert_eq!(
-            hex::encode(sha1_digest(&manually_prepare_sha1(b"abc".to_vec()))),
+            hex::encode(sha1_blocks(&padded, 0, padded.len() / 64)),
             "a9993e364706816aba3e25717850c26c9cd0d89d"
         );
+        let padded = padded_bytes(b"");
         assert_eq!(
-            hex::encode(sha1_digest(&manually_prepare_sha1(Vec::new()))),
+            hex::encode(sha1_blocks(&padded, 0, padded.len() / 64)),
             "da39a3ee5e6b4b0d3255bfef95601890afd80709"
         );
     }
@@ -1694,7 +1672,8 @@ mod tests {
     fn cpu_sha1_matches_the_crypto_crate() {
         let key = key();
         let hashdata = key.hashdata_for(KeyTarget::Primary);
-        let digest = sha1_digest(&manually_prepare_sha1(hashdata.clone()));
+        let padded = padded_bytes(&hashdata);
+        let digest = sha1_blocks(&padded, 0, padded.len() / 64);
         let expected = pgp::crypto::hash::HashAlgorithm::SHA1
             .digest(&hashdata)
             .unwrap();
@@ -1804,5 +1783,13 @@ mod tests {
         assert_eq!(cpu_slice(100_000, 512, 0.01), 1_000);
         // The same window is not worth splitting with fewer candidates.
         assert_eq!(cpu_slice(100_000, 16, 0.01), 0);
+    }
+
+    #[test]
+    fn backend_rate_marks_idle_backends() {
+        assert_eq!(backend_rate(0, 1.0), "--- hash/s");
+        assert_eq!(backend_rate(0, 0.0), "--- hash/s");
+        assert_eq!(backend_rate(5_000_000_000, 1.0), "5.00B hash/s");
+        assert_eq!(backend_rate(4_650_000, 1.0), "4.65M hash/s");
     }
 }
