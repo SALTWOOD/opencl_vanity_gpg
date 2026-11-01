@@ -1,4 +1,5 @@
 mod args;
+#[cfg(feature = "opencl")]
 mod device;
 mod pattern;
 mod vanity_key;
@@ -6,6 +7,7 @@ mod vanity_key;
 use std::{fmt::Write, mem};
 
 pub use args::*;
+#[cfg(feature = "opencl")]
 pub use device::DeviceList;
 use indicatif::*;
 use indicatif_log_bridge::LogWrapper;

@@ -1,15 +1,17 @@
 use anyhow::{bail, ensure, Context};
 use log::*;
+#[cfg(feature = "opencl")]
 use ocl::{Buffer, Device, Platform, ProQue};
 use pgp::types::{PublicKeyTrait, SecretParams};
 use rand::{thread_rng, CryptoRng, Rng};
+#[cfg(feature = "opencl")]
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::{
     collections::HashSet,
     fs,
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::*,
         LazyLock, Mutex,
     },
     thread,
@@ -22,6 +24,7 @@ mod utils;
 
 /// Numbers of words returned by the kernel: timestamp, pattern match mask and
 /// the index of the matched candidate (0 when not batched).
+#[cfg(feature = "opencl")]
 const RESULT_WORDS: usize = 3;
 /// The match mask is a u32, so this many patterns can be searched at once.
 const MAX_PATTERNS: usize = 32;
@@ -153,6 +156,7 @@ fn prepare_hashdata(key: &VanitySecretKey, plan: &SearchPlan) -> anyhow::Result<
 /// the private copy, `hashdata + base` for batched searches). When
 /// `inject_timestamp` is set, word 1 (the creation time) of the packet is
 /// replaced with the candidate timestamp while hashing.
+#[cfg(feature = "opencl")]
 fn sha1_block(index: usize, source: &str, chunks: usize, inject_timestamp: bool) -> String {
     let timestamp_line = if inject_timestamp {
         format!("                if (chunk{index} == 0) w{index}[1] = ts;\n")
@@ -214,6 +218,7 @@ fn sha1_block(index: usize, source: &str, chunks: usize, inject_timestamp: bool)
 /// Emit the code that hashes every searched packet, matches all patterns and
 /// reports the timestamp, the bit mask of the matched patterns and, for
 /// batched searches, which candidate key packet matched.
+#[cfg(feature = "opencl")]
 fn generate_target_checks(
     plan: &SearchPlan,
     patterns: &[ActivePattern],
@@ -288,6 +293,7 @@ fn generate_target_checks(
 }
 
 /// Build the OpenCL program for a plan.
+#[cfg(feature = "opencl")]
 fn build_program(
     device: Device,
     dimension: usize,
@@ -395,16 +401,22 @@ fn main() -> anyhow::Result<()> {
 
     debug!("{:#?}", LazyLock::force(&ARGS));
 
-    let cpu_mode = ARGS.cpu;
+    // A build without the `opencl` feature has no GPU backend at all.
+    let cpu_mode = ARGS.cpu || !cfg!(feature = "opencl");
+    if !cfg!(feature = "opencl") {
+        info!("This build was compiled without OpenCL support; using the CPU");
+    }
 
     // The CPU backend never opens an OpenCL runtime; only list devices or the
     // GPU backend do.
+    #[cfg(feature = "opencl")]
     let device_list = if ARGS.list_device || !cpu_mode {
         Some(utils::DeviceList::new()?)
     } else {
         None
     };
 
+    #[cfg(feature = "opencl")]
     if ARGS.list_device {
         let device_list = device_list
             .as_ref()
@@ -416,6 +428,12 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    #[cfg(not(feature = "opencl"))]
+    if ARGS.list_device {
+        bail!("This build was compiled without OpenCL support, so there are no devices to list");
+    }
+
+    #[cfg(feature = "opencl")]
     let device = if cpu_mode {
         None
     } else {
@@ -428,10 +446,12 @@ fn main() -> anyhow::Result<()> {
         })
     };
 
+    #[cfg(feature = "opencl")]
     if let Some(device) = &device {
         info!("Using device: {}", device.name()?);
     }
 
+    #[cfg(feature = "opencl")]
     let dimension = match (&device, ARGS.thread) {
         (_, Some(v)) => v,
         (Some(device), None) => match device.info(ocl::core::DeviceInfo::MaxWorkItemSizes)? {
@@ -445,6 +465,7 @@ fn main() -> anyhow::Result<()> {
         (None, None) => 0,
     };
 
+    #[cfg(feature = "opencl")]
     let iteration = ARGS.iteration;
 
     let cpu_threads = match ARGS.cpu_threads {
@@ -621,19 +642,26 @@ fn main() -> anyhow::Result<()> {
 
     vanity_key.edit_timestamp(initial_timestamp, &mut rng)?;
 
+    #[cfg(feature = "opencl")]
     let stride = if cpu_mode {
         CPU_ROUND_TIMESTAMPS
     } else {
         (dimension as u64).saturating_mul(iteration as u64)
     };
+    #[cfg(not(feature = "opencl"))]
+    let stride = CPU_ROUND_TIMESTAMPS;
+
     // A GPU launch searches this many timestamps per candidate. When the window
     // is short (young primary key), several fresh candidates are searched in the
     // same launch so the device still gets a full round of work. The CPU backend
     // always searches a single candidate per round.
+    #[cfg(feature = "opencl")]
     let candidates_per_round = match appended_target {
         Some(_) if !cpu_mode => batch_size(search_range, stride),
         _ => 1,
     };
+    #[cfg(not(feature = "opencl"))]
+    let candidates_per_round = 1;
 
     let mut plan = build_plan(&active, &vanity_key)?;
 
@@ -669,8 +697,11 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    #[cfg(feature = "opencl")]
     let mut job_sender = None;
+    #[cfg(feature = "opencl")]
     let mut result_receiver = None;
+    #[cfg(feature = "opencl")]
     if !cpu_mode {
         let (pro_que, buffer_result) = build_program(
             device.expect("a device is selected without --cpu"),
@@ -697,46 +728,62 @@ fn main() -> anyhow::Result<()> {
 
     loop {
         debug!("Run one search round");
-        let (next_candidates, vanity_result): (Vec<VanitySecretKey>, Option<(u32, u32, u32)>) =
-            if cpu_mode {
-                let result = cpu_search(
-                    &hashdata,
-                    &plan,
-                    &active,
-                    bench_size,
-                    forward,
-                    initial_timestamp,
-                    cpu_threads,
-                );
-                let next = next_candidates(
-                    &candidates,
-                    appended_target.is_some(),
-                    candidates_per_round,
-                    initial_timestamp,
-                    &mut rng,
-                )?;
-                (next, result)
-            } else {
-                job_sender
-                    .as_ref()
-                    .expect("the OpenCL thread is running")
-                    .send(OpenClJob::Search {
-                        hashdata: std::mem::take(&mut hashdata),
-                        max_time_range: search_range,
-                    })?;
-                let next = next_candidates(
-                    &candidates,
-                    appended_target.is_some(),
-                    candidates_per_round,
-                    initial_timestamp,
-                    &mut rng,
-                )?;
-                let result = result_receiver
-                    .as_ref()
-                    .expect("the OpenCL thread is running")
-                    .recv()?;
-                (next, result)
-            };
+        #[cfg(feature = "opencl")]
+        let (next_candidates, vanity_result): (
+            Vec<VanitySecretKey>,
+            Option<(u32, u32, u32)>,
+        ) = if cpu_mode {
+            run_cpu_round(
+                &hashdata,
+                &plan,
+                &active,
+                &candidates,
+                appended_target.is_some(),
+                candidates_per_round,
+                bench_size,
+                forward,
+                initial_timestamp,
+                cpu_threads,
+                &mut rng,
+            )?
+        } else {
+            job_sender
+                .as_ref()
+                .expect("the OpenCL thread is running")
+                .send(OpenClJob::Search {
+                    hashdata: std::mem::take(&mut hashdata),
+                    max_time_range: search_range,
+                })?;
+            let next = next_candidates(
+                &candidates,
+                appended_target.is_some(),
+                candidates_per_round,
+                initial_timestamp,
+                &mut rng,
+            )?;
+            let result = result_receiver
+                .as_ref()
+                .expect("the OpenCL thread is running")
+                .recv()?;
+            (next, result)
+        };
+        #[cfg(not(feature = "opencl"))]
+        let (next_candidates, vanity_result): (
+            Vec<VanitySecretKey>,
+            Option<(u32, u32, u32)>,
+        ) = run_cpu_round(
+            &hashdata,
+            &plan,
+            &active,
+            &candidates,
+            appended_target.is_some(),
+            candidates_per_round,
+            bench_size,
+            forward,
+            initial_timestamp,
+            cpu_threads,
+            &mut rng,
+        )?;
 
         let work = bench_size * plan.work_per_nonce() * candidates_per_round as u64;
         hashed += work;
@@ -815,6 +862,7 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 plan = build_plan(&active, key)?;
+                #[cfg(feature = "opencl")]
                 if let Some(tx_job) = &job_sender {
                     let (pro_que, buffer_result) = build_program(
                         device.expect("a device is selected without --cpu"),
@@ -931,6 +979,7 @@ fn per_round_hashes(stride: u64, max_time_range: u32) -> u64 {
 /// window is shorter than that (a recently created primary key), searching
 /// several fresh candidates in the same launch keeps the device busy instead of
 /// paying the launch cost for a tiny amount of work.
+#[cfg(feature = "opencl")]
 fn batch_size(search_range: u32, stride: u64) -> usize {
     const MAX_BATCH: u64 = 512;
     if search_range == 0 {
@@ -978,6 +1027,35 @@ fn next_candidates(
         key.edit_timestamp(timestamp, &mut *rng)?;
         Ok(vec![key])
     }
+}
+
+/// One CPU search round: scan the timestamp window and prepare the next set of
+/// candidate keys.
+#[allow(clippy::too_many_arguments)]
+fn run_cpu_round(
+    hashdata: &[u32],
+    plan: &SearchPlan,
+    active: &[ActivePattern],
+    candidates: &[VanitySecretKey],
+    appended: bool,
+    count: usize,
+    bench_size: u64,
+    forward: bool,
+    initial_timestamp: u32,
+    cpu_threads: usize,
+    rng: &mut (impl Rng + CryptoRng),
+) -> anyhow::Result<(Vec<VanitySecretKey>, Option<(u32, u32, u32)>)> {
+    let result = cpu_search(
+        hashdata,
+        plan,
+        active,
+        bench_size,
+        forward,
+        initial_timestamp,
+        cpu_threads,
+    );
+    let next = next_candidates(candidates, appended, count, initial_timestamp, rng)?;
+    Ok((next, result))
 }
 
 /// SHA-1 over the already padded big-endian words from `manually_prepare_sha1`.
@@ -1176,6 +1254,7 @@ fn cpu_search(
 }
 
 /// Work for the OpenCL thread.
+#[cfg(feature = "opencl")]
 enum OpenClJob {
     /// Use a new program (the searched patterns changed).
     Reconfigure {
@@ -1190,6 +1269,7 @@ enum OpenClJob {
     },
 }
 
+#[cfg(feature = "opencl")]
 fn opencl_thread(
     mut pro_que: ProQue,
     mut buffer_result: Buffer<u32>,
@@ -1329,6 +1409,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "opencl")]
     fn short_windows_search_several_candidates_per_round() {
         let stride = 536_870_912;
         // Unlimited window: one candidate is enough to fill the launch.

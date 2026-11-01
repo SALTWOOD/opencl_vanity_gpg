@@ -10,6 +10,12 @@ opt-level = 3
 panic = "abort"
 strip = true
 
+[features]
+default = ["opencl"]
+# GPU search backend. Build with --no-default-features for a CPU-only binary
+# that does not link against the OpenCL runtime at all.
+opencl = ["dep:ocl"]
+
 [dependencies]
 byteorder = "1.5"
 chrono = { version = "0.4", default-features = false, features = ["now"] }
@@ -17,7 +23,7 @@ clap = { version = "4.5", features = ["derive"] }
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 hex = "0.4"
 log = "0.4"
-ocl = "0.19"
+ocl = { version = "0.19", optional = true }
 pgp = "0.14"
 rand = "0.8"
 smallvec = "1.13"

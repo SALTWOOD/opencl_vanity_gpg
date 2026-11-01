@@ -276,6 +276,16 @@ $ opencl_vanity_gpg --cpu --key-file mykey.asc -c cv25519 -p 77777777 --oneshot
 - 只支持 `--pattern`；`--filter` 是 OpenCL 表达式，CPU 模式会直接报错。
 - CPU 后端是纯 Rust 实现，速度约为每线程 3–4M hash/s（12 线程约 40–50M hash/s），比 GPU 慢两个数量级，适合没有 GPU 的机器或较短的 pattern。
 
+## 只构建 CPU 版本
+
+默认构建包含 GPU（OpenCL）后端，因此程序在启动时依赖 OpenCL 运行库（Windows 上是 `OpenCL.dll`）。如果目标机器根本没有 OpenCL，可以用 `--no-default-features` 编译一个完全不链接 OpenCL 的 CPU 版本：
+
+```console
+$ cargo build --release --no-default-features
+```
+
+这样的程序没有 GPU 后端，总是使用 CPU（`--list-device` 会报错说明不支持），构建时也不再需要 `OpenCL.lib`。不加这个参数时默认包含 GPU 支持。
+
 # 性能对比
 
 | Repo | 计算方式 | 速度（hash/s） | 注释 |

@@ -120,6 +120,8 @@ pub struct HashPattern {
     /// Constraints for the nibbles that are not free.
     pub constraints: Vec<(usize, NibbleConstraint)>,
     /// OpenCL expression over `uint h[5]` implementing the constraints.
+    /// Only the GPU backend reads it, so the CPU-only build does not use it.
+    #[cfg_attr(not(feature = "opencl"), allow(dead_code))]
     pub filter: String,
     /// Reciprocal of the probability that a random fingerprint matches.
     pub possibility: f64,
