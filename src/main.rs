@@ -402,15 +402,30 @@ fn main() -> anyhow::Result<()> {
     debug!("{:#?}", LazyLock::force(&ARGS));
 
     // A build without the `opencl` feature has no GPU backend at all.
-    let cpu_mode = ARGS.cpu || !cfg!(feature = "opencl");
-    if !cfg!(feature = "opencl") {
+    let gpu_available = cfg!(feature = "opencl");
+    if !gpu_available && ARGS.gpu {
+        bail!("This build was compiled without OpenCL support, so --gpu is not available");
+    }
+    let use_gpu = gpu_available && (!ARGS.cpu || ARGS.gpu);
+    let use_cpu = ARGS.cpu || !gpu_available;
+    if !gpu_available {
         info!("This build was compiled without OpenCL support; using the CPU");
     }
+    // The CPU cannot evaluate --filter (an OpenCL expression), so it only
+    // shares the work when patterns are used.
+    let use_cpu = if use_cpu && use_gpu && ARGS.filter.is_some() {
+        warn!(
+            "--filter is an OpenCL expression, so the CPU cannot help with it; searching on the GPU only"
+        );
+        false
+    } else {
+        use_cpu
+    };
 
     // The CPU backend never opens an OpenCL runtime; only list devices or the
     // GPU backend do.
     #[cfg(feature = "opencl")]
-    let device_list = if ARGS.list_device || !cpu_mode {
+    let device_list = if ARGS.list_device || use_gpu {
         Some(utils::DeviceList::new()?)
     } else {
         None
@@ -434,16 +449,16 @@ fn main() -> anyhow::Result<()> {
     }
 
     #[cfg(feature = "opencl")]
-    let device = if cpu_mode {
-        None
-    } else {
+    let device = if use_gpu {
         let device_list = device_list
             .as_ref()
-            .expect("the device list is built without --cpu");
+            .expect("the device list is built when the GPU is used");
         Some(match ARGS.device {
             Some(i) => device_list[i].device,
             None => Device::first(Platform::default())?,
         })
+    } else {
+        None
     };
 
     #[cfg(feature = "opencl")]
@@ -475,8 +490,20 @@ fn main() -> anyhow::Result<()> {
             .map(|threads| threads.get())
             .unwrap_or(1),
     };
-    if cpu_mode {
-        info!("Using the CPU with {cpu_threads} thread(s)");
+    // When both backends run, leave one logical CPU for the OpenCL driver
+    // thread and the main loop.
+    let hybrid_threads = cpu_threads.saturating_sub(1).max(1);
+    if use_cpu {
+        if use_gpu {
+            info!("Using the CPU with {hybrid_threads} thread(s)");
+        } else {
+            info!("Using the CPU with {cpu_threads} thread(s)");
+        }
+    }
+    if use_cpu && use_gpu {
+        info!("Searching on the GPU and the CPU together");
+    }
+    if use_cpu && !use_gpu {
         if ARGS.thread.is_some() || ARGS.iteration != 512 {
             warn!("--thread and --iteration only apply to the GPU and are ignored with --cpu");
         }
@@ -523,7 +550,7 @@ fn main() -> anyhow::Result<()> {
     if ARGS.filter.is_some() && !patterns.is_empty() {
         warn!("--filter is set, so --pattern is ignored");
     }
-    if cpu_mode && ARGS.filter.is_some() {
+    if !use_gpu && ARGS.filter.is_some() {
         bail!("--filter is an OpenCL expression and cannot be evaluated on the CPU; use --pattern instead");
     }
 
@@ -643,10 +670,10 @@ fn main() -> anyhow::Result<()> {
     vanity_key.edit_timestamp(initial_timestamp, &mut rng)?;
 
     #[cfg(feature = "opencl")]
-    let stride = if cpu_mode {
-        CPU_ROUND_TIMESTAMPS
-    } else {
+    let stride = if use_gpu {
         (dimension as u64).saturating_mul(iteration as u64)
+    } else {
+        CPU_ROUND_TIMESTAMPS
     };
     #[cfg(not(feature = "opencl"))]
     let stride = CPU_ROUND_TIMESTAMPS;
@@ -657,7 +684,7 @@ fn main() -> anyhow::Result<()> {
     // always searches a single candidate per round.
     #[cfg(feature = "opencl")]
     let candidates_per_round = match appended_target {
-        Some(_) if !cpu_mode => batch_size(search_range, stride),
+        Some(_) if use_gpu => batch_size(search_range, stride),
         _ => 1,
     };
     #[cfg(not(feature = "opencl"))]
@@ -702,9 +729,9 @@ fn main() -> anyhow::Result<()> {
     #[cfg(feature = "opencl")]
     let mut result_receiver = None;
     #[cfg(feature = "opencl")]
-    if !cpu_mode {
+    if use_gpu {
         let (pro_que, buffer_result) = build_program(
-            device.expect("a device is selected without --cpu"),
+            device.expect("the GPU is enabled but no device was selected"),
             dimension,
             &plan,
             &active,
@@ -726,13 +753,42 @@ fn main() -> anyhow::Result<()> {
     let mut hashed: u64 = 0;
     let mut start = Instant::now();
 
+    // Calibrate the CPU once; the GPU rate is measured every hybrid round.
+    #[cfg(feature = "opencl")]
+    let cpu_rate = if use_gpu && use_cpu {
+        let probe = bench_size.min(200_000);
+        let rate = probe_cpu_rate(
+            &hashdata,
+            &plan,
+            forward,
+            initial_timestamp,
+            hybrid_threads,
+            probe,
+        );
+        info!(
+            "CPU rate probe: {:.1}M hash/s over {probe} timestamps",
+            rate / 1e6
+        );
+        rate
+    } else {
+        0.0
+    };
+    // Share of a round's timestamp window handed to the CPU, re-balanced from
+    // the measured GPU speed after every hybrid round.
+    #[cfg(feature = "opencl")]
+    let mut cpu_fraction: f64 = if cpu_rate > 0.0 {
+        (0.9 * cpu_rate / (cpu_rate + 5e9)).clamp(0.0, 0.05)
+    } else {
+        0.0
+    };
+
     loop {
         debug!("Run one search round");
         #[cfg(feature = "opencl")]
         let (next_candidates, vanity_result): (
             Vec<VanitySecretKey>,
             Option<(u32, u32, u32)>,
-        ) = if cpu_mode {
+        ) = if !use_gpu {
             run_cpu_round(
                 &hashdata,
                 &plan,
@@ -746,7 +802,7 @@ fn main() -> anyhow::Result<()> {
                 cpu_threads,
                 &mut rng,
             )?
-        } else {
+        } else if !use_cpu {
             job_sender
                 .as_ref()
                 .expect("the OpenCL thread is running")
@@ -765,6 +821,29 @@ fn main() -> anyhow::Result<()> {
                 .as_ref()
                 .expect("the OpenCL thread is running")
                 .recv()?;
+            (next, result)
+        } else {
+            let (next, result, fraction) = run_hybrid_round(
+                &mut hashdata,
+                &plan,
+                &active,
+                &candidates,
+                appended_target.is_some(),
+                candidates_per_round,
+                bench_size,
+                forward,
+                search_range,
+                initial_timestamp,
+                hybrid_threads,
+                &mut rng,
+                job_sender.as_ref().expect("the OpenCL thread is running"),
+                result_receiver
+                    .as_ref()
+                    .expect("the OpenCL thread is running"),
+                cpu_fraction,
+                cpu_rate,
+            )?;
+            cpu_fraction = fraction;
             (next, result)
         };
         #[cfg(not(feature = "opencl"))]
@@ -865,7 +944,7 @@ fn main() -> anyhow::Result<()> {
                 #[cfg(feature = "opencl")]
                 if let Some(tx_job) = &job_sender {
                     let (pro_que, buffer_result) = build_program(
-                        device.expect("a device is selected without --cpu"),
+                        device.expect("the GPU is enabled but no device was selected"),
                         dimension,
                         &plan,
                         &active,
@@ -1049,13 +1128,108 @@ fn run_cpu_round(
         hashdata,
         plan,
         active,
-        bench_size,
+        0..bench_size,
         forward,
         initial_timestamp,
         cpu_threads,
+        &AtomicBool::new(false),
     );
     let next = next_candidates(candidates, appended, count, initial_timestamp, rng)?;
     Ok((next, result))
+}
+
+/// One hybrid round: the GPU scans the first part of the timestamp window while
+/// the CPU searches the rest, so both backends are driving different candidates
+/// and the first match wins. Returns the share of the window to give the CPU
+/// next round, based on the measured speed of both backends.
+#[cfg(feature = "opencl")]
+#[allow(clippy::too_many_arguments)]
+fn run_hybrid_round(
+    hashdata: &mut Vec<u32>,
+    plan: &SearchPlan,
+    active: &[ActivePattern],
+    candidates: &[VanitySecretKey],
+    appended: bool,
+    count: usize,
+    window: u64,
+    forward: bool,
+    search_range: u32,
+    initial_timestamp: u32,
+    cpu_threads: usize,
+    rng: &mut (impl Rng + CryptoRng),
+    job_sender: &Sender<OpenClJob>,
+    result_receiver: &Receiver<Option<(u32, u32, u32)>>,
+    fraction: f64,
+    cpu_rate: f64,
+) -> anyhow::Result<(Vec<VanitySecretKey>, Option<(u32, u32, u32)>, f64)> {
+    let cpu_span = cpu_slice(window, count, fraction);
+    if cpu_span == 0 {
+        // Not enough work to share: keep the whole window on the GPU.
+        debug!("hybrid round: CPU idle (window {window}, candidates {count})");
+        job_sender.send(OpenClJob::Search {
+            hashdata: std::mem::take(hashdata),
+            max_time_range: search_range,
+        })?;
+        let next = next_candidates(candidates, appended, count, initial_timestamp, rng)?;
+        return Ok((next, result_receiver.recv()?, fraction));
+    }
+
+    let gpu_span = window - cpu_span;
+    let gpu_hashdata = std::mem::take(hashdata);
+    let cpu_hashdata = gpu_hashdata.clone();
+    let gpu_started = Instant::now();
+    job_sender.send(OpenClJob::Search {
+        hashdata: gpu_hashdata,
+        max_time_range: (gpu_span - 1) as u32,
+    })?;
+
+    // The next candidates are prepared while the GPU is already running.
+    let next = next_candidates(candidates, appended, count, initial_timestamp, rng)?;
+
+    let stop = AtomicBool::new(false);
+    let (gpu_result, cpu_result, gpu_time) = thread::scope(|scope| -> anyhow::Result<_> {
+        let cpu_handle = scope.spawn(|| {
+            cpu_search(
+                &cpu_hashdata,
+                plan,
+                active,
+                gpu_span..window,
+                forward,
+                initial_timestamp,
+                cpu_threads,
+                &stop,
+            )
+        });
+        let gpu_result = result_receiver.recv()?;
+        let gpu_time = gpu_started.elapsed();
+        // The GPU round is over; let the CPU workers finish their slice.
+        stop.store(true, Ordering::Relaxed);
+        let cpu_result = cpu_handle.join().expect("the CPU search thread panicked");
+        Ok((gpu_result, cpu_result, gpu_time))
+    })?;
+
+    // Re-balance the split from the GPU's measured speed and the calibrated CPU
+    // speed, keeping the CPU slightly on the comfortable side so it never
+    // becomes the bottleneck. Only trust a round that ran to completion.
+    let mut next_fraction = fraction;
+    if gpu_result.is_none() && cpu_result.is_none() {
+        let gpu_rate =
+            (gpu_span as f64 * count as f64) / gpu_time.as_secs_f64().max(f64::MIN_POSITIVE);
+        if gpu_rate.is_finite() && gpu_rate > 0.0 && cpu_rate > 0.0 {
+            let ideal = cpu_rate / (cpu_rate + gpu_rate);
+            next_fraction = (ideal * 0.9).clamp(0.0, 0.05);
+        }
+        debug!(
+            "hybrid round: gpu {gpu_time:?} ({:.2}B/s), cpu {:.1}M/s, cpu share {:.3}%",
+            gpu_rate / 1e9,
+            cpu_rate / 1e6,
+            next_fraction * 100.0
+        );
+    } else {
+        debug!("hybrid round: match found");
+    }
+
+    Ok((next, gpu_result.or(cpu_result), next_fraction))
 }
 
 /// SHA-1 over the already padded big-endian words from `manually_prepare_sha1`.
@@ -1169,17 +1343,20 @@ fn round(a: &mut u32, b: &mut u32, c: &mut u32, d: &mut u32, e: &mut u32, k: u32
 
 /// Search the current candidates on the CPU.
 ///
-/// Scans `window` timestamps from `nonce`, in the same direction and with the
-/// same numbering as the OpenCL kernel, and returns
+/// Scans the given timestamp offsets from `nonce`, in the same direction and
+/// with the same numbering as the OpenCL kernel, and returns
 /// `(timestamp, pattern mask, candidate index)` for the first match.
+/// `stop` lets another backend end an in-flight scan early.
+#[allow(clippy::too_many_arguments)]
 fn cpu_search(
     hashdata: &[u32],
     plan: &SearchPlan,
     active: &[ActivePattern],
-    window: u64,
+    offsets: std::ops::Range<u64>,
     forward: bool,
     nonce: u32,
     threads: usize,
+    stop: &AtomicBool,
 ) -> Option<(u32, u32, u32)> {
     let candidates = hashdata.len() / plan.total_words;
     let found = AtomicBool::new(false);
@@ -1191,7 +1368,7 @@ fn cpu_search(
         let mut data = hashdata.to_vec();
 
         for offset in range {
-            if found.load(Ordering::Relaxed) {
+            if found.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
                 return;
             }
 
@@ -1237,20 +1414,95 @@ fn cpu_search(
         }
     };
 
-    let chunk = window.div_ceil(threads as u64).max(1);
+    let total = offsets.end.saturating_sub(offsets.start);
+    let chunk = total.div_ceil(threads as u64).max(1);
     thread::scope(|scope| {
         for thread_index in 0..threads {
-            let start = thread_index as u64 * chunk;
-            if start >= window {
+            let start = offsets.start + thread_index as u64 * chunk;
+            if start >= offsets.end {
                 break;
             }
-            let end = (start + chunk).min(window);
+            let end = (start + chunk).min(offsets.end);
             let scan = &scan;
             scope.spawn(move || scan(start..end));
         }
     });
 
     result.into_inner().unwrap()
+}
+
+/// Timestamp offsets to hand to the CPU in a hybrid round.
+///
+/// `fraction` is the share of the window the CPU measured itself able to cover
+/// in about the time the GPU needs. Returns 0 when the slice would be too small
+/// to pay for spawning the worker threads; the GPU then gets the whole window.
+#[cfg(feature = "opencl")]
+fn cpu_slice(window: u64, candidates: usize, fraction: f64) -> u64 {
+    const MIN_CPU_HASHES: u64 = 200_000;
+    if window < 4 || fraction <= 0.0 {
+        return 0;
+    }
+    let slice = ((window as f64 * fraction) as u64).max(1);
+    if slice.saturating_mul(candidates as u64) < MIN_CPU_HASHES {
+        return 0;
+    }
+    // Leave the GPU at least two offsets so its range argument stays non-zero.
+    slice.min(window - 2)
+}
+
+/// Measure how many hashes per second the CPU backend manages on this machine,
+/// using the same SHA-1 code path as the search but without pattern checks.
+#[cfg(feature = "opencl")]
+fn probe_cpu_rate(
+    hashdata: &[u32],
+    plan: &SearchPlan,
+    forward: bool,
+    nonce: u32,
+    threads: usize,
+    offsets: u64,
+) -> f64 {
+    if offsets == 0 || threads == 0 {
+        return 0.0;
+    }
+    let candidates = hashdata.len() / plan.total_words;
+    let chunk = offsets.div_ceil(threads as u64).max(1);
+    let started = Instant::now();
+    thread::scope(|scope| {
+        for thread_index in 0..threads {
+            let start = thread_index as u64 * chunk;
+            if start >= offsets {
+                break;
+            }
+            let end = (start + chunk).min(offsets);
+            scope.spawn(move || {
+                let mut data = hashdata.to_vec();
+                for offset in start..end {
+                    let ts = if forward {
+                        match nonce.checked_add(offset as u32) {
+                            Some(ts) => ts,
+                            None => return,
+                        }
+                    } else {
+                        match nonce.checked_sub(offset as u32) {
+                            Some(ts) => ts,
+                            None => return,
+                        }
+                    };
+                    for candidate in 0..candidates {
+                        let base = candidate * plan.total_words;
+                        for layout in &plan.layout {
+                            let at = base + layout.offset;
+                            data[at + 1] = ts;
+                            std::hint::black_box(sha1_digest(&data[at..at + layout.chunks * 16]));
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let elapsed = started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
+    // Each timestamp hashes one packet per candidate.
+    offsets as f64 * candidates as f64 / elapsed
 }
 
 /// Work for the OpenCL thread.
@@ -1465,24 +1717,92 @@ mod tests {
 
         // The timestamp is at offset 0 of the window.
         assert_eq!(
-            cpu_search(&hashdata, &plan, &active, 1, true, created_at, 2),
+            cpu_search(
+                &hashdata,
+                &plan,
+                &active,
+                0..1,
+                true,
+                created_at,
+                2,
+                &AtomicBool::new(false)
+            ),
             Some((created_at, 1, 0))
         );
         // Backward search: five seconds after the creation time, the match is
         // at offset 5.
         assert_eq!(
-            cpu_search(&hashdata, &plan, &active, 6, false, created_at + 5, 3),
+            cpu_search(
+                &hashdata,
+                &plan,
+                &active,
+                0..6,
+                false,
+                created_at + 5,
+                3,
+                &AtomicBool::new(false)
+            ),
             Some((created_at, 1, 0))
         );
         // Forward search: five seconds before, also at offset 5.
         assert_eq!(
-            cpu_search(&hashdata, &plan, &active, 6, true, created_at - 5, 3),
+            cpu_search(
+                &hashdata,
+                &plan,
+                &active,
+                0..6,
+                true,
+                created_at - 5,
+                3,
+                &AtomicBool::new(false)
+            ),
+            Some((created_at, 1, 0))
+        );
+        // A slice that starts at offset 5 finds the same timestamp.
+        assert_eq!(
+            cpu_search(
+                &hashdata,
+                &plan,
+                &active,
+                5..6,
+                false,
+                created_at + 5,
+                2,
+                &AtomicBool::new(false)
+            ),
             Some((created_at, 1, 0))
         );
         // A window that does not contain the creation time has no match.
         assert_eq!(
-            cpu_search(&hashdata, &plan, &active, 1, true, created_at + 1, 2),
+            cpu_search(
+                &hashdata,
+                &plan,
+                &active,
+                0..1,
+                true,
+                created_at + 1,
+                2,
+                &AtomicBool::new(false)
+            ),
             None
         );
+    }
+
+    #[test]
+    #[cfg(feature = "opencl")]
+    fn cpu_slice_keeps_the_gpu_busy() {
+        // Tiny windows are not worth splitting.
+        assert_eq!(cpu_slice(1, 1, 0.01), 0);
+        assert_eq!(cpu_slice(3, 1, 0.01), 0);
+        // A fraction of zero disables the CPU share entirely.
+        assert_eq!(cpu_slice(536_870_912, 1, 0.0), 0);
+        // Too little CPU work to pay for the threads.
+        assert_eq!(cpu_slice(100_000, 1, 0.01), 0);
+        // 1% of a large window goes to the CPU.
+        assert_eq!(cpu_slice(536_870_912, 1, 0.01), 5_368_709);
+        // With many candidates the slice is worth it even for small windows.
+        assert_eq!(cpu_slice(100_000, 512, 0.01), 1_000);
+        // The same window is not worth splitting with fewer candidates.
+        assert_eq!(cpu_slice(100_000, 16, 0.01), 0);
     }
 }

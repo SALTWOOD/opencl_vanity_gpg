@@ -118,9 +118,12 @@ Options:
           Read the passphrase of --key-file from the first line of a file
       --cpu
           Search on the CPU instead of the GPU
-          No OpenCL device is opened or used, so this works even when there is no
-          usable device. The binary still links against the OpenCL runtime.
-          --thread and --iteration do not apply.
+          No OpenCL device is opened or used. The binary still links against the
+          OpenCL runtime unless it was built with --no-default-features.
+          Combine with --gpu to search on both at the same time.
+      --gpu
+          Use the GPU (the default)
+          Combine with --cpu to search on the GPU and the CPU at the same time.
       --cpu-threads <N>
           Number of CPU threads to use with --cpu [default: logical CPUs]
   -h, --help
@@ -262,19 +265,24 @@ $ gpg --import vanity-keys/*.asc
 
 # 使用 CPU 计算
 
-没有可用的 GPU，或者想把 GPU 空出来时，可以加 `--cpu` 完全使用 CPU 计算——不会初始化 GPU、也不会打开任何 OpenCL 设备，即使没有可用的 OpenCL 设备也能用（注意程序本身仍然在链接期依赖 OpenCL 运行库）：
+默认只使用 GPU。需要时可以用 `--cpu` 只用 CPU，或用 `--cpu --gpu` 让两者同时搜索：
 
 ```console
-# 用 12 个线程在 CPU 上算号
+# 只用 CPU（12 线程）
 $ opencl_vanity_gpg --cpu --cpu-threads 12 -c ed25519 -p 77777777 --oneshot
 
+# GPU 和 CPU 同时搜索
+$ opencl_vanity_gpg --cpu --gpu -c ed25519 -p 77777777 --oneshot
+
 # 在已有密钥上追加靓号子密钥同样适用
-$ opencl_vanity_gpg --cpu --key-file mykey.asc -c cv25519 -p 77777777 --oneshot
+$ opencl_vanity_gpg --cpu --gpu --key-file mykey.asc -c cv25519 -p 77777777 --oneshot
 ```
 
-- `--cpu` 模式下 `--thread`、`--iteration`、`--device` 都不再生效，线程数用 `--cpu-threads`（默认为逻辑 CPU 数）。
-- 只支持 `--pattern`；`--filter` 是 OpenCL 表达式，CPU 模式会直接报错。
-- CPU 后端是纯 Rust 实现，速度约为每线程 3–4M hash/s（12 线程约 40–50M hash/s），比 GPU 慢两个数量级，适合没有 GPU 的机器或较短的 pattern。
+- `--cpu` 只用 CPU，不会初始化 GPU，也不会打开任何 OpenCL 设备（但程序仍然在链接期依赖 OpenCL 运行库，除非用 `--no-default-features` 构建）。
+- `--gpu` 就是不写参数时的默认行为。`--cpu --gpu` 时，每轮的时间戳窗口按两者实测速度分给 GPU 和 CPU 并行搜索：CPU 通常只分担约 0.5%–1%，两边搜索不同的时间戳，任意一方先命中就采用谁的结果。CPU 的份额会随每轮实测的 GPU 速度自动调整，并预留一个逻辑 CPU 给 OpenCL 驱动线程，因此不会拖慢 GPU；受算力比例限制，整体提升约 1%。窗口太小时 CPU 会自动不参与该轮。
+- `--cpu` 模式下 `--thread`、`--iteration`、`--device` 都不再生效，线程数用 `--cpu-threads`（默认为逻辑 CPU 数；混合模式下会少用一个）。
+- 只支持 `--pattern`：`--filter` 是 OpenCL 表达式，纯 CPU 模式会直接报错；混合模式下 CPU 会自动退出，只用 GPU。
+- CPU 后端是纯 Rust 实现，速度约为每线程 3–4M hash/s（12 线程约 40–50M hash/s），比 GPU 慢两个数量级，适合没有 GPU 的机器、较短的 pattern，或者作为 GPU 的少量补充。
 
 ## 只构建 CPU 版本
 
