@@ -5,13 +5,22 @@
 #define __INJECTS__
 #ifdef __INJECTS__
 #define FUTURE_MODE (0)
+#define BATCHED (0)
 #define TOTAL_WORDS (4)
 #endif
 
 __kernel void vanity_sha1(__constant uint *hashdata, __global uint *result, const ulong iter, const uint max_time_range) {
+#if BATCHED
+    // Many candidate key packets are searched in one launch: read the packet
+    // currently being hashed straight from the buffer (the timestamp is
+    // substituted in the generated code), so the private copy would only waste
+    // registers.
+    uint nonce = hashdata[1];
+#else
     uint data[TOTAL_WORDS];
     for (uint i = 0; i < TOTAL_WORDS; i++) data[i] = hashdata[i];
     uint nonce = data[1];
+#endif
 
     uint thread_id = get_global_id(0);
 

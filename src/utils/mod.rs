@@ -10,7 +10,7 @@ pub use device::DeviceList;
 use indicatif::*;
 use indicatif_log_bridge::LogWrapper;
 pub use pattern::{HashPattern, TargetSelector};
-pub use vanity_key::VanitySecretKey;
+pub use vanity_key::{load_secret_key, VanitySecretKey};
 
 /// Do SHA-1 padding manually
 /// A SHA-1 block is 512 bit, so the output Vec<u32> length is a multiple of 16

@@ -1,5 +1,6 @@
 use anyhow::bail;
 use clap::{Parser, ValueEnum};
+use pgp::{composed::KeyType, crypto::ecc_curve::ECCCurve};
 use std::str::FromStr;
 use std::sync::LazyLock;
 
@@ -118,6 +119,32 @@ pub struct Args {
     /// future_timestamp = false: search from (start_timestamp - max_time_range) to start_timestamp
     #[arg(long, verbatim_doc_comment)]
     pub max_time_range: Option<u32>,
+
+    /// Add a vanity subkey to this existing secret key instead of generating a new one
+    /// Accepts an exported secret key (ASCII-armored or binary), for example:
+    /// `gpg --export-secret-keys --armor <KEY-ID> > key.asc`
+    /// --cipher-suite selects the subkey type: cv25519 / ecdh-* add an
+    /// encryption subkey, ed25519-sign / ecdsa-*-sign add a signing subkey
+    /// The primary key and its existing subkeys are kept as they are
+    #[arg(long, value_name = "PATH", verbatim_doc_comment)]
+    pub key_file: Option<String>,
+
+    /// Select a key by fingerprint or key ID when --key-file contains several keys
+    #[arg(long, value_name = "KEY_ID", requires = "key_file")]
+    pub key_id: Option<String>,
+
+    /// Passphrase of the key given by --key-file, if it is protected
+    #[arg(long, value_name = "PASSPHRASE", requires = "key_file")]
+    pub passphrase: Option<String>,
+
+    /// Read the passphrase of --key-file from the first line of a file
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "key_file",
+        conflicts_with = "passphrase"
+    )]
+    pub passphrase_file: Option<String>,
 }
 
 impl Default for Args {
@@ -141,6 +168,10 @@ impl Default for Args {
             future_timestamp: false,
             start_timestamp: None,
             max_time_range: None,
+            key_file: None,
+            key_id: None,
+            passphrase: None,
+            passphrase_file: None,
         }
     }
 }
@@ -177,6 +208,25 @@ impl CipherSuite {
             }
             _ => KeyTarget::Primary,
         }
+    }
+
+    /// The subkey this suite adds when a key is imported with `--key-file`.
+    pub fn subkey_spec(self) -> anyhow::Result<(KeyType, KeyTarget)> {
+        Ok(match self {
+            Self::Cv25519 => (KeyType::ECDH(ECCCurve::Curve25519), KeyTarget::Encrypt),
+            Self::EcdhP256 => (KeyType::ECDH(ECCCurve::P256), KeyTarget::Encrypt),
+            Self::EcdhP384 => (KeyType::ECDH(ECCCurve::P384), KeyTarget::Encrypt),
+            Self::EcdhP521 => (KeyType::ECDH(ECCCurve::P521), KeyTarget::Encrypt),
+            Self::Ed25519Sign => (KeyType::EdDSALegacy, KeyTarget::Sign),
+            Self::EcdsaP256Sign => (KeyType::ECDSA(ECCCurve::P256), KeyTarget::Sign),
+            Self::EcdsaP384Sign => (KeyType::ECDSA(ECCCurve::P384), KeyTarget::Sign),
+            Self::EcdsaP521Sign => (KeyType::ECDSA(ECCCurve::P521), KeyTarget::Sign),
+            _ => bail!(
+                "--key-file appends a subkey, so --cipher-suite must name a subkey type: \
+                 cv25519, ecdh-p256, ecdh-p384, ecdh-p521, ed25519-sign, \
+                 ecdsa-p256-sign, ecdsa-p384-sign or ecdsa-p521-sign"
+            ),
+        })
     }
 }
 

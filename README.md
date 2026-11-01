@@ -103,6 +103,19 @@ Options:
           Maximum time range to search in seconds
           future_timestamp =  true: search from start_timestamp to (start_timestamp + max_time_range)
           future_timestamp = false: search from (start_timestamp - max_time_range) to start_timestamp
+      --key-file <PATH>
+          Add a vanity subkey to this existing secret key instead of generating a new one
+          Accepts an exported secret key (ASCII-armored or binary), for example:
+          `gpg --export-secret-keys --armor <KEY-ID> > key.asc`
+          --cipher-suite selects the subkey type: cv25519 / ecdh-* add an
+          encryption subkey, ed25519-sign / ecdsa-*-sign add a signing subkey
+          The primary key and its existing subkeys are kept as they are
+      --key-id <KEY_ID>
+          Select a key by fingerprint or key ID when --key-file contains several keys
+      --passphrase <PASSPHRASE>
+          Passphrase of the key given by --key-file, if it is protected
+      --passphrase-file <PATH>
+          Read the passphrase of --key-file from the first line of a file
   -h, --help
           Print help
   -V, --version
@@ -196,6 +209,49 @@ $ opencl_vanity_gpg -c ed25519-sign -p primary:AAAA -p sign:BBBB --shot-all
 - `^ABCD`：以 ABCD 开头；
 - `##!A`：末 3 位依次是十进制数字、十进制数字、且不是 A；
 - `sign:####`：签名子密钥末 4 位都是十进制数字。
+
+# 在已有密钥上追加靓号子密钥
+
+除了从零生成整把密钥，还可以为**已经存在**的密钥追加一个靓号子密钥：主密钥和原有的子密钥完全保持不变（指纹、自签名都不变），只有新子密钥的指纹交给 GPU 计算。
+
+先导出已有的私钥（建议先备份）：
+
+```console
+$ gpg --export-secret-keys --armor <KEY-ID> > mykey.asc
+```
+
+然后指定 `--key-file`，并用 `-c` 选择要追加的子密钥类型：
+
+```console
+# 追加加密子密钥（指纹以 77777777 结尾）
+$ opencl_vanity_gpg --key-file mykey.asc -c cv25519 -p 77777777 --oneshot -o vanity-keys
+
+# 追加签名子密钥（指纹末 4 位是十进制数字）
+$ opencl_vanity_gpg --key-file mykey.asc -c ed25519-sign -p sign:#### --oneshot -o vanity-keys
+
+# 密钥有口令保护时
+$ opencl_vanity_gpg --key-file mykey.asc --passphrase '……' -c cv25519 -p 77777777 --oneshot
+
+# 口令从文件读取（取第一行）；文件里有多把密钥时用 --key-id 选择
+$ opencl_vanity_gpg --key-file keyring.gpg --key-id 0x12345678 --passphrase-file pass.txt -c cv25519 -p ABCD
+```
+
+输出的文件是包含新子密钥的**完整私钥**（命名为 `<主密钥指纹>-<新子密钥指纹>-sec.asc`），直接用 `gpg --import` 导入即可：
+
+```console
+$ gpg --import vanity-keys/*.asc
+```
+
+需要注意：
+
+- `-c` 必须指定子密钥类型：`cv25519`、`ecdh-p256`、`ecdh-p384`、`ecdh-p521` 追加加密子密钥；`ed25519-sign`、`ecdsa-p256-sign`、`ecdsa-p384-sign`、`ecdsa-p521-sign` 追加签名子密钥（会同时生成交叉认证签名）。其他取值会报错。
+- 只支持 v4 密钥（v6 密钥使用 SHA-256 指纹，而 GPU 内核只实现了 SHA-1）。
+- 只有新子密钥参与匹配：`-a primary`、`primary:` 前缀等都会报错，因为导入的密钥包不会重新生成。
+- 新子密钥的创建时间不会早于主密钥的创建时间（GnuPG 拒绝生成这种密钥）。所以对**刚刚创建**的密钥没有“过去”可以搜索，程序会自动改为向未来搜索并打印提示；也可以用 `--start-timestamp`、`--future-timestamp`、`--max-time-range` 自行控制。
+- 当可搜索的时间窗口很短（主密钥很新）时，程序会自动在一次 GPU 启动中并行搜索多份候选子密钥（日志会提示 `N candidate subkeys are searched per GPU round`），避免每轮只计算少量哈希而拖慢速度。
+- 新子密钥继承导入密钥的口令保护：搜索过程中候选密钥不加密，命中后才用同一口令加密。
+- 原有子密钥会保留。GnuPG 加密时一般使用最新的加密子密钥；如果只想使用新子密钥，可以用 `gpg --edit-key` 撤销旧的或给它设置过期时间。
+- 重新导入后如果旧子密钥仍在，它们依然可用，行为与普通的“多子密钥”密钥相同。
 
 # 性能对比
 
